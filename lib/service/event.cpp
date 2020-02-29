@@ -11,13 +11,14 @@
 #include <dvbsi++/content_descriptor.h>
 #include <dvbsi++/parental_rating_descriptor.h>
 #include <dvbsi++/descriptor_tag.h>
+#include <dvbsi++/pdc_descriptor.h>
 
 #include <sys/types.h>
 #include <fcntl.h>
 
 // static members / methods
-std::string eServiceEvent::m_language = "---";
-std::string eServiceEvent::m_language_alternative = "---";
+std::string eServiceEvent::m_language = "";
+std::string eServiceEvent::m_language_alternative = "";
 
 ///////////////////////////
 
@@ -26,16 +27,12 @@ DEFINE_REF(eComponentData);
 DEFINE_REF(eGenreData);
 DEFINE_REF(eParentalData);
 
-eServiceEvent::eServiceEvent():
-	m_begin(0), m_duration(0), m_event_id(0)
-{
-}
-
 /* search for the presence of language from given EIT event descriptors*/
 bool eServiceEvent::loadLanguage(Event *evt, const std::string &lang, int tsidonid)
 {
 	bool retval=0;
 	std::string language = lang;
+	bool isNew = false;
 	for (DescriptorConstIterator desc = evt->getDescriptors()->begin(); desc != evt->getDescriptors()->end(); ++desc)
 	{
 		switch ((*desc)->getTag())
@@ -49,12 +46,22 @@ bool eServiceEvent::loadLanguage(Event *evt, const std::string &lang, int tsidon
 				std::string cc = sed->getIso639LanguageCode();
 				std::transform(cc.begin(), cc.end(), cc.begin(), tolower);
 				int table=encodingHandler.getCountryCodeDefaultMapping(cc);
-				if (language == "---" || language.find(cc) != std::string::npos)
+				if (language == "" || language.find(cc) != std::string::npos)
 				{
 					/* stick to this language, avoid merging or mixing descriptors of different languages */
 					language = cc;
-					m_event_name += replace_all(replace_all(convertDVBUTF8(sed->getEventName(), table, tsidonid), "\n", " ",table), "\t", " ",table);
+					std::string evtName = replace_all(replace_all(convertDVBUTF8(sed->getEventName(), table, tsidonid), "\n", " ",table), "\t", " ",table);
+					if (evtName.find("New: ") == 0)
+					{
+						m_event_name += evtName.substr(5);
+						isNew = true;
+					}
+					else
+					{
+						m_event_name += evtName;
+					}
 					m_short_description += convertDVBUTF8(sed->getText(), table, tsidonid);
+					
 					retval=1;
 				}
 				break;
@@ -65,7 +72,7 @@ bool eServiceEvent::loadLanguage(Event *evt, const std::string &lang, int tsidon
 				std::string cc = eed->getIso639LanguageCode();
 				std::transform(cc.begin(), cc.end(), cc.begin(), tolower);
 				int table=encodingHandler.getCountryCodeDefaultMapping(cc);
-				if (language == "---" || language.find(cc) != std::string::npos)
+				if (language == "" || language.find(cc) != std::string::npos)
 				{
 					/* stick to this language, avoid merging or mixing descriptors of different languages */
 					language = cc;
@@ -76,12 +83,23 @@ bool eServiceEvent::loadLanguage(Event *evt, const std::string &lang, int tsidon
 					 * Unfortunately we cannot recognise this, but we'll use the length of the short description
 					 * to guess whether we should concatenate both descriptions (without any spaces)
 					 */
-					if (m_extended_description.empty() && m_short_description.size() >= 180)
+					if (eed->getText().empty() && m_short_description.size() >= 180)
 					{
 						m_extended_description = m_short_description;
 						m_short_description = "";
 					}
-					m_extended_description += convertDVBUTF8(eed->getText(), table, tsidonid);
+					if (table == 0) // Two Char Mapping EED must be processed in one pass
+					{
+						m_tmp_extended_description += eed->getText();
+						if (eed->getDescriptorNumber() == eed->getLastDescriptorNumber())
+						{
+							m_extended_description += convertDVBUTF8(m_tmp_extended_description, table, tsidonid);
+						}
+					}
+					else
+					{
+						m_extended_description += convertDVBUTF8(eed->getText(), table, tsidonid);
+					}
 					retval=1;
 				}
 #if 0
@@ -98,6 +116,17 @@ bool eServiceEvent::loadLanguage(Event *evt, const std::string &lang, int tsidon
 			}
 			default:
 				break;
+		}
+	}
+	if (isNew)
+	{
+		if (m_extended_description.empty())
+		{
+			m_short_description += " [New]";
+		}
+		else
+		{
+			m_extended_description += " [New]";
 		}
 	}
 	if ( retval == 1 )
@@ -166,6 +195,12 @@ bool eServiceEvent::loadLanguage(Event *evt, const std::string &lang, int tsidon
 					}
 					break;
 				}
+				case PDC_DESCRIPTOR:
+				{
+					const PdcDescriptor *pdcd = (PdcDescriptor *)*desc;
+					m_pdc_pil = pdcd->getProgrammeIdentificationLabel();
+					break;
+				}
 			}
 		}
 	}
@@ -180,11 +215,13 @@ RESULT eServiceEvent::parseFrom(Event *evt, int tsidonid)
 	m_event_id = evt->getEventId();
 	uint32_t duration = evt->getDuration();
 	m_duration = fromBCD(duration>>16)*3600+fromBCD(duration>>8)*60+fromBCD(duration);
-	if (m_language != "---" && loadLanguage(evt, m_language, tsidonid))
+	uint8_t running_status = evt->getRunningStatus();
+	m_running_status = running_status;
+	if (m_language != "" && loadLanguage(evt, m_language, tsidonid))
 		return 0;
-	if (m_language_alternative != "---" && loadLanguage(evt, m_language_alternative, tsidonid))
+	if (m_language_alternative != "" && loadLanguage(evt, m_language_alternative, tsidonid))
 		return 0;
-	if (loadLanguage(evt, "---", tsidonid))
+	if (loadLanguage(evt, "", tsidonid))
 		return 0;
 	return 0;
 }
@@ -252,7 +289,7 @@ RESULT eServiceEvent::getGenreData(ePtr<eGenreData> &dest) const
 	return -1;
 }
 
-PyObject *eServiceEvent::getGenreDataList() const
+PyObject *eServiceEvent::getGenreData() const
 {
 	ePyObject ret = PyList_New(m_genres.size());
 	int cnt=0;
@@ -280,7 +317,7 @@ RESULT eServiceEvent::getParentalData(ePtr<eParentalData> &dest) const
 	return -1;
 }
 
-PyObject *eServiceEvent::getParentalDataList() const
+PyObject *eServiceEvent::getParentalData() const
 {
 	ePyObject ret = PyList_New(m_ratings.size());
 	int cnt = 0;
@@ -310,7 +347,7 @@ RESULT eServiceEvent::getComponentData(ePtr<eComponentData> &dest, int tagnum) c
 	return -1;
 }
 
-PyObject *eServiceEvent::getComponentDataList() const
+PyObject *eServiceEvent::getComponentData() const
 {
 	ePyObject ret = PyList_New(m_component_data.size());
 	int cnt = 0;
